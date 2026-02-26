@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -127,6 +128,9 @@ type MorphAnalyzer struct {
 	// Ссылка на mmap-объект, чтобы он не был собран сборщиком мусора
 	// и память оставалась доступной.
 	mmapFile mmap.MMap
+
+	// Кеш для getFormsByParadigmID — парадигм конечное число, результат стабильный.
+	formsCache sync.Map
 }
 
 // PredictionCandidate - временная структура для хранения кандидата на предсказание.
@@ -591,23 +595,21 @@ func (a *MorphAnalyzer) Predict(word string, lemma string) []*Parsed {
 // Пробует суффиксы длиной от 5 до 1, ищет их в DAWG предсказателя.
 // Среди всех найденных правил выбирает то, у которого самый длинный суффикс,
 // а при равенстве длин - самая высокая частота.
+//
+// Оптимизация: вместо сбора всех кандидатов в слайс и сортировки,
+// трекаем лучшего кандидата инлайн — zero allocations.
 func (a *MorphAnalyzer) findBestPrediction(word string) *PredictionCandidate {
 	runes := []rune(word)
-	var candidates []PredictionCandidate
+	var best *PredictionCandidate
 
-	// Итерируемся по возможным длинам суффиксов, от самой длинной (5) к самой короткой (1).
-	// Это позволяет нам рано прекратить поиск, если будет найдено более специфичное правило.
 	for suffixLen := 5; suffixLen >= 1; suffixLen-- {
-		// Пропускаем, если слово короче, чем текущая длина суффикса.
 		if suffixLen > len(runes) {
 			continue
 		}
 
-		// Вырезаем суффикс нужной длины и ищем его в DAWG предсказателя.
 		suffix := string(runes[len(runes)-suffixLen:])
 		currentNodeIndex, foundSuffix := uint32(0), true
 
-		// Обходим DAWG предсказателя.
 		for _, char := range suffix {
 			childNodeIndex, ok := a.findChildGeneral(currentNodeIndex, char, a.predictNodes, a.predictEdges)
 			if !ok {
@@ -621,46 +623,33 @@ func (a *MorphAnalyzer) findBestPrediction(word string) *PredictionCandidate {
 			continue
 		}
 
-		// Если суффикс найден и узел является финальным (т.е. это конец правила),
-		// собираем все правила (payloads) из этого узла
-		// и добавляем их в наш список кандидатов.
-		payloadStart, payloadEnd := a.predictNodes[currentNodeIndex].PayloadIdx,
-			a.predictNodes[currentNodeIndex].PayloadIdx+uint32(a.predictNodes[currentNodeIndex].PayloadLen)
+		payloadStart := a.predictNodes[currentNodeIndex].PayloadIdx
+		payloadEnd := payloadStart + uint32(a.predictNodes[currentNodeIndex].PayloadLen)
 		for _, p := range a.predictPayloads[payloadStart:payloadEnd] {
-			candidates = append(candidates, PredictionCandidate{PredictInfo: p, SuffixLen: suffixLen})
+			if best == nil || suffixLen > best.SuffixLen ||
+				(suffixLen == best.SuffixLen && p.Frequency > best.Frequency) {
+				c := PredictionCandidate{PredictInfo: p, SuffixLen: suffixLen}
+				best = &c
+			}
 		}
 	}
-	// Если ни одного кандидата не найдено, возвращаем nil.
-	if len(candidates) == 0 {
-		return nil
-	}
 
-	// Сортируем всех найденных кандидатов по нашим правилам приоритета
-	sort.Slice(candidates, func(i, j int) bool {
-		// Сначала сравниваем по длине суффикса (чем больше, тем лучше).
-		if candidates[i].SuffixLen != candidates[j].SuffixLen {
-			return candidates[i].SuffixLen > candidates[j].SuffixLen
-		}
-		// Если длины равны, сравниваем по частоте (чем больше, тем лучше).
-		return candidates[i].Frequency > candidates[j].Frequency
-	})
-
-	// Возвращаем самого лучшего кандидата, который оказался на первом месте после сортировки.
-	return &candidates[0]
+	return best
 }
 
 // getFormsByParadigmID возвращает канонически отсортированный срез всех словоформ для данной парадигмы.
 // Сортировка важна для того, чтобы FormIdx из предсказателя всегда указывал на одно и то же слово.
+// Результат кешируется — парадигм конечное число, результат детерминированный.
 func (a *MorphAnalyzer) getFormsByParadigmID(pID uint32) []string {
-	// Находим информацию о парадигме, включая все ее возможные основы (stems).
+	if cached, ok := a.formsCache.Load(pID); ok {
+		return cached.([]string)
+	}
+
 	paradigmInfoSlice, ok := a.paradigms[pID]
 	if !ok {
 		return nil
 	}
 
-	// Используем `dfsGenerate` для сбора всех форм и их тегов в карту resultsMap.
-	// resultsMap используется как set, чтобы автоматически избавиться от дубликатов,
-	// которые могли бы возникнуть из-за разных основ (stems).
 	resultsMap := make(map[string]uint32)
 	for _, pInfo := range paradigmInfoSlice {
 		a.dfsGenerate(pInfo.NodeID, []rune(pInfo.Stem), pID, resultsMap)
@@ -670,14 +659,14 @@ func (a *MorphAnalyzer) getFormsByParadigmID(pID uint32) []string {
 		return nil
 	}
 
-	// Преобразуем ключи карты (уникальные словоформы) в срез.
 	forms := make([]string, 0, len(resultsMap))
 	for form := range resultsMap {
 		forms = append(forms, form)
 	}
 
-	// Сортируем срез по алфавиту. Это критически важный шаг для стабильности определения по `FormIdx`.
-	sort.Strings(forms)
+	slices.Sort(forms)
+
+	a.formsCache.Store(pID, forms)
 	return forms
 }
 
